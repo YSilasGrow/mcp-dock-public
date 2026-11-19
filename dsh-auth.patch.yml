@@ -1,0 +1,19 @@
+# Restore the desktop-managed credential provider for one-shot headless runs.
+# No credential value is stored in this file.
+- id: credentials
+  disabled: false
+- id: authorization
+  disabled: false
+- id: deepseek-account
+  disabled: false
+- id: agent-default-model
+  config:
+    provider: deepseek-account
+    model: deepseek-flash
+    reasoningEffort: high
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true

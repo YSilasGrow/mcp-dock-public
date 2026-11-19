@@ -1,0 +1,22 @@
+.local/
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+*.jsonl
+*.app/
+outputs/
+projects/
+
+# Local backups, screenshots, and editor settings
+backups/
+*.bak
+screenshots/
+.idea/
+.vscode/
