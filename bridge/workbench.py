@@ -1,15 +1,19 @@
 """Local task conversations and bridge history for the browser workbench."""
 
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from urllib.parse import parse_qs, urlsplit
 
-from . import tasks
+from . import events, tasks
 from .events import read_events
 from .research import all_snapshots
 
 TASK_CARDS_SCRIPT = Path(__file__).with_name("task_cards.js")
+TEAM_PAGE = Path(__file__).with_name("team_run.html")
+TEAM_SCRIPT = Path(__file__).with_name("team_run.js")
 MAX_TASK_REQUEST_BYTES = 64 * 1024
 
 PAGE = """<!doctype html>
@@ -223,6 +227,59 @@ PAGE = """<!doctype html>
 """
 
 
+def _id(value):
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None:
+        raise ValueError("编号格式无效")
+    return value
+
+
+def _query_id(query, name):
+    params = parse_qs(query, keep_blank_values=True)
+    if set(params) != {name} or len(params[name]) != 1:
+        raise ValueError("请提供唯一的" + name)
+    return _id(params[name][0])
+
+
+def _team_task(task_id, *, writing=False):
+    task = next((task for task in tasks.list_tasks() if task["task_id"] == task_id), None)
+    if task is None:
+        raise LookupError("找不到任务")
+    if writing and task["status"] == "archived":
+        raise ValueError("已归档的任务为只读")
+    return task
+
+
+def _team_fields(payload, required, optional=()):
+    if (not isinstance(payload, dict) or not required.issubset(payload)
+            or set(payload) - required - set(optional)):
+        raise ValueError("请求字段不完整或无法识别")
+    for value in payload.values():
+        if not isinstance(value, str) or "\x00" in value or any(0xD800 <= ord(c) <= 0xDFFF for c in value):
+            raise ValueError("请求字段必须是有效文本")
+
+
+class WorkbenchServer(ThreadingHTTPServer):
+    def __init__(self, address, handler):
+        super().__init__(address, handler)
+        self._team_db = events._path().parent / "team-runs" / "runs.sqlite3"
+        self._store = None
+        self._store_lock = Lock()
+        try:
+            store = self.team_store()
+            if store is not None:
+                store.recover()
+        except Exception:
+            self.server_close()
+            raise
+
+    def team_store(self, *, create=False):
+        with self._store_lock:
+            if self._store is None and (create or self._team_db.exists()):
+                from .team_runs import RunStore
+                self._store = RunStore(self._team_db)
+            return self._store
+
+
 class Handler(BaseHTTPRequestHandler):
     def _allowed_host(self):
         allowed_hosts = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
@@ -239,6 +296,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/assets/task-cards.js":
             self._send(TASK_CARDS_SCRIPT.read_bytes(), "text/javascript; charset=utf-8")
+            return
+        if parsed.path == "/team":
+            self._send(TEAM_PAGE.read_bytes(), "text/html; charset=utf-8")
+            return
+        if parsed.path == "/assets/team-run.js":
+            self._send(TEAM_SCRIPT.read_bytes(), "text/javascript; charset=utf-8")
+            return
+        if parsed.path in {"/api/team/runs", "/api/team/run"}:
+            try:
+                if parsed.path == "/api/team/runs":
+                    task = _team_task(_query_id(parsed.query, "task_id"))
+                    store = self.server.team_store()
+                    runs = [] if store is None else store.list_runs(task["task_id"])
+                    from .team_assistant import ASSISTANT_INSTRUCTIONS
+                    payload = {"task": task, "runs": runs, "assistant_instructions": ASSISTANT_INSTRUCTIONS}
+                else:
+                    payload = self._get_run(_query_id(parsed.query, "id"))
+                    _team_task(payload["task_id"])
+            except LookupError as error:
+                self._send_json({"error": str(error)}, 404)
+                return
+            except ValueError as error:
+                self._send_json({"error": str(error)}, 400)
+                return
+            self._send_json(payload, 200)
             return
         if parsed.path == "/api/events":
             raw = parse_qs(parsed.query).get("after", ["0"])[0]
@@ -257,9 +339,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         host = self._allowed_host()
         if host is None or self.headers.get_all("Origin", []) != [f"http://{host}"]:
-            self._send_json({"error": "只允许从同源工作台创建任务"}, 403)
+            self._send_json({"error": "只允许从同源工作台提交请求"}, 403)
             return
-        if self.path != "/api/tasks":
+        if self.path not in {"/api/tasks", "/api/team/start", "/api/team/answer", "/api/team/stop-waiting"}:
             self._send_json({"error": "接口不存在"}, 404)
             return
         types = self.headers.get_all("Content-Type", [])
@@ -281,16 +363,51 @@ class Handler(BaseHTTPRequestHandler):
             if len(raw) != length:
                 raise ValueError("请求体不完整")
             payload = json.loads(raw.decode("utf-8"))
-            if not isinstance(payload, dict) or set(payload) - {"title", "goal"}:
-                raise ValueError("只接受标题和任务说明")
-            task = tasks.create_task(payload.get("title"), payload.get("goal", ""), actor="user")
+            if self.path == "/api/tasks":
+                if not isinstance(payload, dict) or set(payload) - {"title", "goal"}:
+                    raise ValueError("只接受标题和任务说明")
+                result = tasks.create_task(payload.get("title"), payload.get("goal", ""), actor="user")
+            else:
+                result = self._team_mutation(payload)
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             self._send_json({"error": "请求体不是有效的 JSON"}, 400)
             return
         except ValueError as error:
             self._send_json({"error": str(error)}, 400)
             return
-        self._send_json(task, 201)
+        except LookupError as error:
+            self._send_json({"error": str(error)}, 404)
+            return
+        self._send_json(result, 201 if self.path == "/api/tasks" else 200)
+
+    def _get_run(self, run_id):
+        store = self.server.team_store()
+        if store is not None:
+            try:
+                return store.get(run_id)
+            except ValueError as error:
+                raise LookupError("找不到模拟运行") from error
+        raise LookupError("找不到模拟运行")
+
+    def _team_mutation(self, payload):
+        # MCP may archive a card in another process. Keep the journal read lock
+        # through the SQLite write so archive and simulation have a clear order.
+        with events._locked_file(False):
+            if self.path == "/api/team/start":
+                _team_fields(payload, {"task_id", "request_id", "scenario", "brief", "lead"},
+                             optional={"assistant", "assistant_question"})
+                _team_task(_id(payload["task_id"]), writing=True)
+                return self.server.team_store(create=True).start(**payload)
+            if self.path == "/api/team/stop-waiting":
+                _team_fields(payload, {"run_id"})
+                run = self._get_run(_id(payload["run_id"]))
+                _team_task(run["task_id"], writing=True)
+                return self.server.team_store().stop_waiting(run["id"])
+            _team_fields(payload, {"run_id", "help_id", "action"}, optional={"value"})
+            _id(payload["help_id"])
+            run = self._get_run(_id(payload["run_id"]))
+            _team_task(run["task_id"], writing=True)
+            return self.server.team_store().answer(**payload)
 
     def _send_json(self, payload, status):
         self._send(json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -313,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
 def make_server(host="127.0.0.1", port=57420):
     if host != "127.0.0.1":
         raise ValueError("workbench must bind to 127.0.0.1")
-    return ThreadingHTTPServer((host, port), Handler)
+    return WorkbenchServer((host, port), Handler)
 
 
 def serve(host="127.0.0.1", port=57420):

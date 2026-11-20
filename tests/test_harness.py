@@ -1,5 +1,6 @@
 import fcntl
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,8 +16,12 @@ from bridge.workspace import Workspace, WorkspaceError
 class HarnessTests(unittest.TestCase):
     def _fake_harness(self, root, body):
         executable = Path(root) / "fake-dsh"
-        executable.write_text(f"#!{sys.executable}\n" + body, encoding="utf-8")
+        warmup = "import os, sys\nif os.environ.get('FAKE_DSH_WARMUP'):\n    sys.exit(0)\n"
+        executable.write_text(f"#!{sys.executable}\n" + warmup + body, encoding="utf-8")
         executable.chmod(0o700)
+        # macOS checks a freshly written executable on its first launch (~0.4 s here).
+        # Pay that cost now so it does not eat into the sub-second idle windows below.
+        subprocess.run([str(executable)], env={**os.environ, "FAKE_DSH_WARMUP": "1"}, check=True, timeout=10)
         patch_file = Path(root) / "patch.yml"
         patch_file.write_text("[]", encoding="utf-8")
         return executable, patch_file
@@ -49,12 +54,65 @@ class HarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             executable, patch_file = self._fake_harness(root, "import time\ntime.sleep(10)\n")
             started = time.monotonic()
-            with patch.object(harness, "DSH", executable), patch.object(harness, "PATCH", patch_file), patch.object(harness, "HARNESS_TIMEOUT_SECONDS", 0.2):
-                with self.assertRaisesRegex(harness.HarnessError, "timed out"):
+            with patch.object(harness, "DSH", executable), patch.object(harness, "PATCH", patch_file), patch.object(harness, "HARNESS_RECEIPT_TIMEOUT_SECONDS", 0.25):
+                with self.assertRaisesRegex(harness.HarnessError, "did not confirm receipt.*not received"):
                     harness._run("test", root, mode="read-only")
             self.assertLess(time.monotonic() - started, 2)
 
-    def test_run_timeout_releases_descendant_lock_before_returning(self):
+    def test_after_receipt_silence_does_not_end_the_call_and_usage_is_counted(self):
+        body = (
+            'import json, time\n'
+            'for event in ({"type":"status","phase":"step_start","step":1},\n'
+            '              {"type":"tool_call","tool":"web_search","callId":"one"},\n'
+            '              {"type":"tool_result","status":"completed","callId":"one","result":"ok"},\n'
+            '              {"type":"thinking","text":"next"}, {"type":"text","text":"done"},\n'
+            '              {"type":"status","phase":"step_end","usage":{"totalTokens":9}}):\n'
+            '    time.sleep(0.05)\n'
+            '    print(json.dumps(event), flush=True)\n'
+            'time.sleep(1.0)  # thinking quietly, far longer than the receipt window\n'
+            'print(json.dumps({"type":"final","text":"done"}), flush=True)\n'
+        )
+        received = []
+        with tempfile.TemporaryDirectory() as root:
+            executable, patch_file = self._fake_harness(root, body)
+            with patch.object(harness, "DSH", executable), patch.object(harness, "PATCH", patch_file), patch.object(harness, "HARNESS_RECEIPT_TIMEOUT_SECONDS", 0.3):
+                result = harness._run("test", root, mode="read-only", on_receipt=lambda: received.append(1))
+        self.assertEqual(result["answer"], "done")
+        self.assertEqual(result["usage"]["total_tokens"], 9)
+        self.assertEqual(received, [1])
+
+    def test_malformed_lines_and_keepalives_do_not_count_as_receipt(self):
+        body = (
+            'import json, time\n'
+            'for _ in range(20):\n'
+            '    print("bad json", flush=True)\n'
+            '    for event in ({"type":"heartbeat"}, {"type":"status","phase":"ping"},\n'
+            '                  {"type":"text","text":""}, {"type":"tool_call"}, ["noise"]):\n'
+            '        print(json.dumps(event), flush=True)\n'
+            '    time.sleep(0.05)\n'
+            'print(json.dumps({"type":"final","text":"late"}), flush=True)\n'
+        )
+        with tempfile.TemporaryDirectory() as root:
+            executable, patch_file = self._fake_harness(root, body)
+            with patch.object(harness, "DSH", executable), patch.object(harness, "PATCH", patch_file), patch.object(harness, "HARNESS_RECEIPT_TIMEOUT_SECONDS", 0.3):
+                with self.assertRaisesRegex(harness.HarnessError, "did not confirm receipt"):
+                    harness._run("test", root, mode="read-only")
+
+    def test_explicit_hard_deadline_wins_despite_continuous_steps(self):
+        body = (
+            'import json, time\n'
+            'for step in range(40):\n'
+            '    print(json.dumps({"type":"status","phase":"step_end","step":step}), flush=True)\n'
+            '    time.sleep(0.06)\n'
+            'print(json.dumps({"type":"final","text":"late"}), flush=True)\n'
+        )
+        with tempfile.TemporaryDirectory() as root:
+            executable, patch_file = self._fake_harness(root, body)
+            with patch.object(harness, "DSH", executable), patch.object(harness, "PATCH", patch_file):
+                with self.assertRaisesRegex(harness.HarnessError, "timed out after 1 seconds.*hard"):
+                    harness._run("test", root, mode="read-only", timeout_seconds=1)
+
+    def test_stopping_the_wait_releases_descendant_lock_before_returning(self):
         with tempfile.TemporaryDirectory() as root:
             lock = Path(root) / "profile.lock"
             ready = Path(root) / "lock-acquired"
@@ -73,9 +131,11 @@ class HarnessTests(unittest.TestCase):
                 'print(json.dumps({"type":"status","phase":"step_start"}), flush=True)\n',
             )
             started = time.monotonic()
-            with patch.object(harness, "DSH", executable), patch.object(harness, "PATCH", patch_file), patch.object(harness, "HARNESS_TIMEOUT_SECONDS", 0.5):
-                with self.assertRaisesRegex(harness.HarnessError, "timed out"):
-                    harness._run("test", root, mode="read-only")
+            cancel = threading.Event()
+            threading.Timer(0.5, cancel.set).start()
+            with patch.object(harness, "DSH", executable), patch.object(harness, "PATCH", patch_file):
+                with self.assertRaisesRegex(harness.HarnessCancelled, "已停止等待.*已收到"):
+                    harness._run("test", root, mode="read-only", cancel=cancel)
             self.assertLess(time.monotonic() - started, 2)
             self.assertTrue(ready.is_file(), "descendant must have acquired the lock")
             with lock.open("r") as handle:

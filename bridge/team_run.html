@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>团队运行 · MCP Dock</title>
+  <style>
+    :root {
+      color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --page: #10131b; --panel: #1b2230; --line: #38455a; --text: #edf2fa;
+      --muted: #b1bfd1; --link: #a8cdff; --green: #9de5c3; --gold: #ffd49c;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: var(--page); color: var(--text); line-height: 1.55; overflow-wrap: anywhere; }
+    header { background: #171c28; border-bottom: 1px solid var(--line); }
+    header nav, main { width: min(1080px, 100%); margin: auto; padding: 0 24px; }
+    header nav { min-height: 55px; display: flex; align-items: center; gap: 15px; flex-wrap: wrap; font-size: 14px; }
+    .brand { font-weight: 750; letter-spacing: .01em; }
+    header a, .history a, .detail a { color: var(--link); text-underline-offset: 3px; }
+    .mode { color: var(--green); margin-left: auto; }
+    main { padding-top: 28px; padding-bottom: 64px; }
+    h1,h2,h3,h4,p,ol,ul,pre { margin: 0; }
+    h1 { font-size: clamp(24px, 4vw, 32px); line-height: 1.3; }
+    h2, summary.title { font-size: 18px; font-weight: 680; }
+    h3 { font-size: 16px; }
+    h4 { font-size: 14px; }
+    .goal { white-space: pre-wrap; color: var(--muted); margin: 6px 0 0; }
+    .launch, .history, .detail { border: 1px solid var(--line); background: var(--panel); border-radius: 12px; padding: 18px 20px; }
+    .launch { margin: 20px 0 16px; }
+    summary { cursor: pointer; color: var(--link); }
+    .launch summary { color: var(--text); }
+    .launch[open] summary { margin-bottom: 10px; }
+    .muted, .hint, .time { color: var(--muted); }
+    .hint, .time { font-size: 13px; }
+    .controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 16px; margin: 14px 0; }
+    .wide { grid-column: 1/-1; }
+    label { display: block; font-size: 14px; font-weight: 600; }
+    input,textarea,select,button { font: inherit; }
+    select,textarea { color: var(--text); background: #131a26; border: 1px solid #60718a; border-radius: 7px; width: 100%; padding: 8px; margin-top: 5px; }
+    textarea { vertical-align: top; resize: vertical; }
+    button { cursor: pointer; border-radius: 7px; border: 1px solid #61738d; background: #253348; color: var(--text); padding: 8px 14px; }
+    .primary { color: #111d2c; background: var(--link); border-color: var(--link); font-weight: 680; }
+    button:disabled, select:disabled, textarea:disabled { opacity: .65; cursor: default; }
+    button:focus-visible, a:focus-visible, summary:focus-visible, textarea:focus-visible, select:focus-visible { outline: 3px solid #b3d3ff; outline-offset: 3px; }
+    .layout { display: grid; grid-template-columns: minmax(215px, .84fr) minmax(0, 2.16fr); gap: 16px; align-items: start; }
+    .history ol, .attempts, .events { list-style: none; padding: 0; }
+    .history li { margin-top: 10px; }
+    .history a { display: block; background: #151c28; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; text-decoration: none; }
+    .history a[aria-current] { border-left: 3px solid var(--link); background: #233048; }
+    .history a:hover { border-color: var(--link); }
+    .history small, .time { display: block; color: var(--muted); }
+    .detail > section, .detail > details { margin-top: 18px; }
+    .row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .state { font-size: 13px; background: #303d51; color: var(--text); border-radius: 5px; padding: 2px 7px; }
+    .state[data-state="waiting"], .state[data-state="failed"], .state[data-state="interrupted"] { color: var(--gold); background: #463626; }
+    .state[data-state="completed"], .state[data-state="success"] { color: var(--green); background: #203c32; }
+    .help { padding: 14px 16px; background: #302a24; border: 1px solid #816748; border-left: 3px solid var(--gold); border-radius: 7px; }
+    .help h3 { color: var(--gold); }
+    .help p, .help form, .events li + li { margin-top: 8px; }
+    .buttons { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .attempts li { border-left: 2px solid var(--line); margin: 10px 0 0 4px; padding: 0 0 2px 13px; }
+    .attempts summary, .events li, .detail details { font-size: 14px; }
+    .attempts details { margin-top: 5px; }
+    .detail pre, .preview { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 5px; padding: 9px 11px; background: #131a26; border-radius: 6px; font: 13px/1.6 ui-monospace, monospace; }
+    .assistant-answer, .assistant-input { border-left: 3px solid var(--green); padding: 4px 0 4px 14px; }
+    .assistant-answer h3 { color: var(--green); }
+    .assistant-answer pre { color: var(--text); font: inherit; }
+    .assistant-input summary { margin-top: 8px; }
+    .notice { color: var(--gold); margin-top: 10px; }
+    .notice:empty { display: none; }
+    .empty { color: var(--muted); padding-top: 8px; }
+    @media (max-width: 700px) {
+      header nav, main { padding-left: 14px; padding-right: 14px; }
+      .layout { display: flex; flex-direction: column; }
+      .history, .detail { width: 100%; padding: 14px; }
+      .history ol { max-height: 220px; overflow: auto; }
+      .launch { padding: 14px; }
+      .controls { grid-template-columns: minmax(0,1fr); }
+    }
+  </style>
+  <script src="/assets/team-run.js" defer></script>
+</head>
+<body>
+  <header><nav aria-label="工作台导航"><span class="brand">MCP Dock</span><a href="/">返回任务卡</a><span class="mode">本机工作台</span></nav></header>
+  <main>
+    <h1 id="task-title">团队运行</h1>
+    <p id="task-goal" class="goal"></p>
+    <p id="notice" role="status" class="notice"></p>
+    <details class="launch" id="launch" hidden>
+      <summary class="title">发起团队运行</summary>
+      <p class="hint">固定模板「开发与交叉评审」在本机模拟主做、复核和验证。可另选 DeepSeek 提供真实的第二意见。每次返工单独批准，首轮最多追加 2 轮。</p>
+      <form id="start-form">
+        <div class="controls">
+          <label for="lead">主做与复核<select id="lead"><option value="codex">Codex 主做 · Claude 复核</option><option value="claude">Claude 主做 · Codex 复核</option></select></label>
+          <div><label for="assistant">助手</label><select id="assistant"><option value="off">关闭 · 仅本机模拟</option><option value="deepseek">DeepSeek · 真实调用</option></select></div>
+          <label for="scenario">模拟场景<select id="scenario">
+            <option value="success">正常完成</option><option value="timeout">调用超时</option>
+            <option value="missing">缺少材料</option><option value="limit">达到额度</option>
+            <option value="choice">需要选择</option><option value="review">复核要求修改</option>
+            <option value="test_failure">测试失败</option>
+          </select></label>
+          <label class="wide" for="brief">本轮说明<textarea id="brief" rows="2" maxlength="5000" placeholder="填写这次模拟的目标和验收条件"></textarea></label>
+          <div class="wide assistant-input" id="assistant-input" hidden>
+            <label for="assistant-question">给 DeepSeek 的问题</label>
+            <p class="hint" id="assistant-sharing">助手只收到下方单独填写的问题和固定指令。回复将交给本机模拟复核，返工沿用本次意见。</p>
+            <textarea id="assistant-question" rows="3" maxlength="5000" aria-describedby="assistant-sharing"></textarea>
+            <details open><summary>发给 DeepSeek 的完整提示</summary><pre id="assistant-preview" class="preview"></pre></details>
+          </div>
+        </div>
+        <button id="start" class="primary" type="submit">启动模拟运行</button>
+        <p id="start-status" class="notice" role="status"></p>
+      </form>
+    </details>
+    <div class="layout" id="workspace" hidden>
+      <aside class="history" aria-labelledby="history-title">
+        <h2 id="history-title">运行记录</h2>
+        <ol id="run-list"></ol>
+        <p class="empty" id="no-runs">这张任务卡还没有团队运行。</p>
+      </aside>
+      <section class="detail" id="detail" aria-label="运行详情">
+        <h2>运行详情</h2><p class="empty">启动后可在这里查看节点、求助和产物。</p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

@@ -33,6 +33,47 @@ const taskCards = (() => {
     card.preview.textContent = card.previewText || "暂无消息";
   }
 
+  function addTeamRun(details, taskId) {
+    const query = new URLSearchParams({task_id: taskId});
+    const section = add(details, "section", "", "task-goal");
+    const link = add(section, "a", "团队模拟运行");
+    link.style.color = "#a4c8ff";
+    link.href = "/team?" + query;
+    const latest = add(section, "p", "", "task-hint");
+    const milestones = {started: "模拟运行已启动", waiting: "等主人", revised: "已开返工轮",
+      stopped: "已收工", completed: "模拟完成"};
+    const statuses = {running: "运行中", waiting: "等主人", revised: "已开返工轮", stopped: "已收工", completed: "模拟完成"};
+    let generation = 0;
+    async function refresh() {
+      if (!details.open) return;
+      const version = ++generation;
+      try {
+        const response = await fetch("/api/team/runs?" + query, {cache: "no-store"});
+        if (!response.ok) throw new Error();
+        const {runs} = await response.json();
+        if (version !== generation) return;
+        latest.replaceChildren();
+        if (!runs.length) return;
+        const run = runs[0];
+        const round = run.round === 1 ? "首轮" : "返工第 " + (run.round - 1) + " 轮";
+        const recent = add(latest, "a", "最近运行 · " + round + " · " + (statuses[run.status] || run.status));
+        recent.href = "/team?" + new URLSearchParams({task_id: taskId, run_id: run.id});
+        recent.style.color = "#a4c8ff";
+        const result = await fetch("/api/team/run?" + new URLSearchParams({id: run.id}), {cache: "no-store"});
+        if (!result.ok) return;
+        const record = await result.json();
+        if (version !== generation) return;
+        for (const row of record.history.filter(row => milestones[row.event])) {
+          add(latest, "span", " · " + milestones[row.event]);
+        }
+      } catch (_) {
+        if (version === generation && !latest.children.length) latest.textContent = "团队运行状态暂时无法读取。";
+      }
+    }
+    details.addEventListener("toggle", refresh);
+    return refresh;
+  }
+
   function createCard(event) {
     const details = document.createElement("details");
     details.className = "task-card";
@@ -48,10 +89,11 @@ const taskCards = (() => {
       add(details, "p", "任务说明（调用大肥鱼时会发送）", "task-hint task-goal");
       add(details, "p", event.goal, "body");
     }
+    const refreshTeam = addTeamRun(details, event.task_id);
     const history = add(details, "section");
     history.setAttribute("aria-label", event.title + "的对话");
     const card = {
-      stateLabel, summary, preview, history, status: event.status, previewText: "", count: 0,
+      stateLabel, summary, preview, history, refreshTeam, status: event.status, previewText: "", count: 0,
       participants: new Set([event.role]), calls: new Map(),
     };
     cards.set(event.task_id, card);
@@ -80,9 +122,12 @@ const taskCards = (() => {
     }
     add(details, "pre", event.text, "body");
     rememberOpen(details, "prompt:" + event.call_id);
+    // A call without timeout_seconds waits until DeepSeek answers; it never expires here.
+    const limited = Number.isInteger(event.timeout_seconds);
     card.calls.set(event.call_id, {
-      state, expires: Date.parse(event.at) + event.timeout_seconds * 1000,
-      result: null, reply: false,
+      state, sent: Date.parse(event.at),
+      expires: limited ? Date.parse(event.at) + event.timeout_seconds * 1000 : Infinity,
+      result: null, reply: false, received: null,
     });
   }
 
@@ -105,6 +150,9 @@ const taskCards = (() => {
       } else if (event.kind === "thread_result") {
         const call = card.calls.get(event.call_id);
         if (call) call.result = event;
+      } else if (event.kind === "thread_received") {
+        const call = card.calls.get(event.call_id);
+        if (call) call.received = Date.parse(event.at);
       } else if (event.kind === "thread_reply" || event.kind === "thread_message") {
         entry(card, (actors[event.role] || event.role) + " · " + (event.share ? "可共享" : "仅本地"), event.text);
         if (event.kind === "thread_reply") {
@@ -123,7 +171,9 @@ const taskCards = (() => {
       for (const call of card.calls.values()) {
         const result = call.result;
         let state = "running";
-        let label = "进行中";
+        const minutes = Math.floor((Date.now() - call.sent) / 60000);
+        let label = call.received ? "本机 Harness 已开始处理，等待大肥鱼回复" + (minutes > 0 ? " · 已等 " + minutes + " 分钟" : "")
+          : "已提交，等待本机 Harness 报告开始处理";
         if (result?.state === "finished") {
           state = call.reply ? "finished" : "incomplete";
           label = call.reply ? "调用完成" : "调用成功，回复未保存";
@@ -164,6 +214,9 @@ const taskCards = (() => {
     }
   });
 
+  window.addEventListener("pageshow", event => {
+    if (event.persisted) for (const card of cards.values()) card.refreshTeam();
+  });
   rememberOpen(document.getElementById("uncategorized"), "uncategorized");
   return {applyEvents, refreshCallStates};
 })();

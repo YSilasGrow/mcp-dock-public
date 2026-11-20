@@ -62,11 +62,14 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                     expected = {"create_task", "list_tasks", "update_task_status", "post_message", "read_thread",
                                 "thread_ask_deepseek"}
                     self.assertTrue(expected <= tools.keys(), expected - tools.keys())
-                    dispatch_schema = tools["thread_ask_deepseek"].inputSchema
-                    self.assertNotIn("timeout_seconds", dispatch_schema["required"])
-                    timeout = dispatch_schema["properties"].get("timeout_seconds", {})
-                    self.assertEqual({key: timeout.get(key) for key in ("type", "minimum", "maximum", "default")},
-                                     {"type": "integer", "minimum": 1, "maximum": 600, "default": 180})
+                    for name in ("thread_ask_deepseek", "research_ask_deepseek"):
+                        dispatch_schema = tools[name].inputSchema
+                        self.assertNotIn("timeout_seconds", dispatch_schema["required"])
+                        timeout = dispatch_schema["properties"].get("timeout_seconds", {})
+                        # Optional: omitted means no total limit, otherwise 1-600 seconds.
+                        self.assertIsNone(timeout.get("default"))
+                        integer = next(item for item in timeout["anyOf"] if item.get("type") == "integer")
+                        self.assertEqual((integer.get("minimum"), integer.get("maximum")), (1, 600))
                     created = await session.call_tool("create_task", {"title": "MCP 新任务"})
                     self.assertFalse(created.isError, created.content)
                     task = created.structuredContent

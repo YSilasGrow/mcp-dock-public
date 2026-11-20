@@ -43,18 +43,31 @@ class PromptTests(unittest.TestCase):
         research.record_phase(self.rid, "independent", "finished")
         observed = []
 
-        def fake(task, on_event=None):
+        def fake(task, on_event=None, *, timeout_seconds, on_receipt=None):
             logged = [row for row in events.read_all_events() if row["kind"] == "question"]
+            self.assertEqual(timeout_seconds, 45)
+            starts = [r for r in events.read_all_events() if r.get("actor") == "deepseek" and r.get("state") == "started"]
+            self.assertEqual(starts[-1]["timeout_seconds"], timeout_seconds)
             observed.append((task, logged[-1]["text"], logged[-1]["template_version"]))
             return {"answer": "D1 来源 NOT_TRIED", "usage": {"total_tokens": 1}}
 
         with patch.object(server, "consult_prepared", side_effect=fake):
-            result = server.research_ask_deepseek(self.rid, "independent")
+            result = server.research_ask_deepseek(self.rid, "independent", timeout_seconds=45)
         self.assertEqual(observed[0][0], observed[0][1])
         self.assertTrue(observed[0][2])
         self.assertEqual(result["answer"], "D1 来源 NOT_TRIED")
         phases = [row["state"] for row in events.read_all_events() if row["kind"] == "research_phase" and row["actor"] == "deepseek"]
         self.assertEqual(phases, ["started", "finished"])
+
+    def test_invalid_research_timeout_rejected_before_launch_or_dispatch(self):
+        research.record_phase(self.rid, "independent", "skipped")
+        before = events.read_all_events()
+        with patch.object(server, "consult_prepared") as call:
+            for invalid in (0, 601, True, 3.2, "60"):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    server.research_ask_deepseek(self.rid, "independent", timeout_seconds=invalid)
+        self.assertEqual(events.read_all_events(), before)
+        call.assert_not_called()
 
     def test_timeout_records_partial_phase_without_answer(self):
         research.record(self.rid, [{"claim_id": "C1", "text": "自己的结论", "author": "codex"}], [])
@@ -73,7 +86,8 @@ class PromptTests(unittest.TestCase):
         outcomes = []
         calls = []
 
-        def fake(task, on_event=None):
+        def fake(task, on_event=None, *, timeout_seconds, on_receipt=None):
+            self.assertIsNone(timeout_seconds)
             calls.append(task)
             time.sleep(0.1)
             return {"answer": "D1 NOT_TRIED", "usage": {}}

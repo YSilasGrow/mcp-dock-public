@@ -146,7 +146,10 @@ def read_thread(thread_id: str, limit: int = 100, after_id: str | None = None) -
     }
 
 
-def start_thread_dispatch(thread_id: str, question: str, mode: str, *, timeout_seconds: int) -> dict:
+def start_thread_dispatch(thread_id: str, question: str, mode: str, *, timeout_seconds: int | None = None) -> dict:
+    """timeout_seconds None records a call that waits until DeepSeek answers."""
+    if timeout_seconds is not None and (type(timeout_seconds) is not int or timeout_seconds < 1):
+        raise ValueError("timeout_seconds 可省略，或为正整数")
     question = _text(question, "问题", MAX_MESSAGE)
     if mode not in {"shared", "independent"}:
         raise ValueError("调用模式必须为 shared 或 independent")
@@ -195,6 +198,13 @@ def start_thread_dispatch(thread_id: str, question: str, mode: str, *, timeout_s
         }
 
     return append_validated_event(build)
+
+
+def mark_thread_received(dispatch: dict) -> None:
+    """Record that Harness started working on this call; the reply may take as long as it needs."""
+    fields = {name: dispatch[name] for name in ("task_id", "thread_id", "call_id")}
+    append_validated_event(lambda _: {**fields, "kind": "thread_received", "role": "system",
+                                      "text": "大肥鱼已收到，正在处理"})
 
 
 def finish_thread_dispatch(dispatch: dict, state: str, *, answer: str = "", error: str = "") -> None:

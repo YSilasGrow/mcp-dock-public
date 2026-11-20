@@ -5,6 +5,7 @@ import threading
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from bridge import events, research
@@ -25,6 +26,28 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(result["question_public"], "公开问题")
         self.assertEqual(len(result["research_id"]), 32)
         self.assertEqual(events.read_all_events()[0]["kind"], "research_start")
+
+    def test_running_call_warning_uses_stored_deadline_and_legacy_fallback(self):
+        rid = research.start("公开问题", "", 120)["research_id"]
+        research.record_deepseek_phase(rid, "independent", "started", "c1")
+        for limit, age, stalled in ((600, 300, False), (600, 640, True),
+                                    (20, 55, True), (None, 200, False), (None, 220, True)):
+            with self.subTest(limit=limit, age=age):
+                # read_all_events shares row objects with its cache; edit copies only.
+                rows = [dict(row) for row in events.read_all_events()]
+                rows[-1]["at"] = (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
+                if limit is not None:
+                    rows[-1]["timeout_seconds"] = limit
+                self.assertEqual(research.snapshot(rid, rows)["warning"] == "调用疑似卡住", stalled)
+
+    def test_running_call_without_a_limit_is_never_called_stuck(self):
+        rid = research.start("公开问题", "", 120)["research_id"]
+        research.record_deepseek_phase(rid, "independent", "started", "c2", timeout_seconds=None)
+        rows = [dict(row) for row in events.read_all_events()]
+        rows[-1]["at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        view = research.snapshot(rid, rows)
+        self.assertNotEqual(view["warning"], "调用疑似卡住")
+        self.assertEqual(view["state"], "进行中")
 
     def test_record_idempotence_references_and_conflict(self):
         rid = research.start("公开问题", "", 120)["research_id"]

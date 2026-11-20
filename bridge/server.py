@@ -7,7 +7,8 @@ from typing import Annotated, Any
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from .harness import HARNESS_TIMEOUT_SECONDS, MAX_ERROR_CHARS, HarnessError, consult, consult_prepared, delegate
+from .harness import (HARNESS_TIMEOUT_SECONDS, MAX_ERROR_CHARS, HarnessError, consult, consult_prepared, delegate,
+                      validate_timeout_seconds)
 from .events import append_event, append_research_event, read_all_events
 from . import research, tasks
 from .research_prompts import build_task
@@ -15,7 +16,9 @@ from .workspace import DEFAULT_ROOT, Workspace
 
 
 mcp = FastMCP("deepseek-bridge")
-MAX_THREAD_TIMEOUT_SECONDS = 600
+MAX_THREAD_TIMEOUT_SECONDS = HARNESS_TIMEOUT_SECONDS
+# Omitted means no total limit: the call only has to be received.
+OptionalLimit = Annotated[int | None, Field(strict=True, ge=1, le=HARNESS_TIMEOUT_SECONDS)]
 
 
 @mcp.tool()
@@ -94,8 +97,17 @@ def research_record_phase(research_id: str, phase: str, state: str, disagreement
 
 
 @mcp.tool()
-def research_ask_deepseek(research_id: str, phase: str) -> dict:
-    """Run one bounded DeepSeek research phase using only this round's stored public facts."""
+def research_ask_deepseek(
+    research_id: str,
+    phase: str,
+    timeout_seconds: OptionalLimit = None,
+) -> dict:
+    """Run one DeepSeek research phase using only this round's stored public facts.
+
+    The call only has to be received: Harness must start the task within 120 seconds. After
+    that it waits until DeepSeek answers. timeout_seconds (1-600) optionally caps the total.
+    """
+    validate_timeout_seconds(timeout_seconds)
     research.validate_deepseek_call(research_id, phase)
     version, task = build_task(research_id, phase, read_all_events())
     call_id = uuid.uuid4().hex
@@ -105,7 +117,7 @@ def research_ask_deepseek(research_id: str, phase: str) -> dict:
             raise ValueError("research round already finished")
         return None
 
-    research.record_deepseek_phase(research_id, phase, "started", call_id)
+    research.record_deepseek_phase(research_id, phase, "started", call_id, timeout_seconds=timeout_seconds)
     try:
         append_research_event({"v": 1, "research_id": research_id, "role": "codex", "kind": "question",
                                "text": task, "call_id": call_id, "template_version": version, "phase": phase}, validate_log)
@@ -113,7 +125,8 @@ def research_ask_deepseek(research_id: str, phase: str) -> dict:
         research.record_deepseek_phase(research_id, phase, "failed", call_id, error=f"prompt log failed: {exc}"[:500])
         raise
     try:
-        result = consult_prepared(task, on_event=lambda event: _record_status(event, call_id))
+        result = consult_prepared(task, on_event=lambda event: _record_status(event, call_id),
+                                  timeout_seconds=timeout_seconds)
     except Exception as exc:
         state = "timeout" if "timed out" in str(exc).lower() else "failed"
         research.record_deepseek_phase(research_id, phase, state, call_id, error=str(exc)[:500])
@@ -168,14 +181,20 @@ def thread_ask_deepseek(
     thread_id: str,
     question: str,
     mode: str,
-    timeout_seconds: Annotated[int, Field(strict=True, ge=1, le=MAX_THREAD_TIMEOUT_SECONDS)] = HARNESS_TIMEOUT_SECONDS,
+    timeout_seconds: OptionalLimit = None,
 ) -> dict[str, Any]:
-    """Ask DeepSeek in one task. Shared also sends marked messages. Timeout is in whole seconds (default 180)."""
-    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= MAX_THREAD_TIMEOUT_SECONDS:
-        raise ValueError(f"timeout_seconds 必须是 1 到 {MAX_THREAD_TIMEOUT_SECONDS} 的整数")
+    """Ask DeepSeek in one task. Shared also sends marked messages.
+
+    The call only has to be received: Harness must start the task within 120 seconds, and the
+    thread then shows it as delivered. After that it waits until DeepSeek answers, and the reply
+    is saved to the thread even if this tool call is abandoned. timeout_seconds (1-600)
+    optionally caps the total.
+    """
+    validate_timeout_seconds(timeout_seconds)
     dispatch = tasks.start_thread_dispatch(thread_id, question, mode, timeout_seconds=timeout_seconds)
     try:
-        result = consult_prepared(dispatch["text"], timeout_seconds=timeout_seconds)
+        result = consult_prepared(dispatch["text"], timeout_seconds=timeout_seconds,
+                                  on_receipt=lambda: tasks.mark_thread_received(dispatch))
         answer = result["answer"]
         if not isinstance(answer, str):
             raise HarnessError("DeepSeek Harness returned an invalid answer")

@@ -1,0 +1,10 @@
+# MCP Dock team assistant: one read-only question from an empty temporary profile.
+# The desktop profile's instructions, memory and sessions stay out; only the
+# credential file is shared, by path. No credential value is stored here.
+- id: credentials
+  config:
+    path: !!js process.env.MCP_DOCK_CREDENTIAL_FILE
+- id: tool-fs
+  disabled: true
+- id: tool-fs-search
+  disabled: true

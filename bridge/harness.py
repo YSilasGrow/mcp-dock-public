@@ -19,7 +19,11 @@ DSH = Path("/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bi
 PATCH = Path(__file__).resolve().parent.parent / "dsh-auth.patch.yml"
 MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 MAX_CHANGES = 20
-HARNESS_TIMEOUT_SECONDS = 180
+# A call only has to be received: Harness must report that it started working on the task.
+# After that it may search and think for as long as it needs; the caller can stop waiting.
+HARNESS_RECEIPT_TIMEOUT_SECONDS = 120
+# Upper bound for an optional, caller-chosen total limit. No limit applies by default.
+HARNESS_TIMEOUT_SECONDS = 600
 MAX_ERROR_CHARS = 500
 STDERR_TAIL_BYTES = 8192
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -43,9 +47,37 @@ class HarnessError(RuntimeError):
     pass
 
 
-def _environment(mode):
+class HarnessCancelled(HarnessError):
+    """The owner stopped waiting. The task was received, so usage may already exist."""
+
+
+def validate_timeout_seconds(value):
+    """An explicit total limit is optional: None means wait until DeepSeek answers."""
+    if value is None:
+        return None
+    if type(value) is not int or not 1 <= value <= HARNESS_TIMEOUT_SECONDS:
+        raise ValueError(f"timeout_seconds 可省略（不限时），或为 1 到 {HARNESS_TIMEOUT_SECONDS} 的整数")
+    return value
+
+
+def _is_progress(event):
+    # dsh-headless --json emits committed model text and tool/step boundaries.
+    kind = event.get("type")
+    if kind == "status":
+        return event.get("phase") in ("turn_start", "step_start", "step_end", "turn_end")
+    if kind in ("thinking", "text", "final"):
+        return isinstance(event.get("text"), str) and bool(event["text"].strip())
+    if kind == "tool_call":
+        return bool(event.get("callId") and event.get("tool"))
+    if kind == "tool_result":
+        return bool(event.get("callId") and event.get("status") in ("completed", "error"))
+    return False
+
+
+def _environment(mode, overrides=None):
     keep = ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME", "SHELL", "DSH_HOME")
     env = {key: os.environ[key] for key in keep if key in os.environ}
+    env.update(overrides or {})
     env["DSH_PERMISSION_MODE"] = mode
     return env
 
@@ -92,54 +124,114 @@ def _failure_message(summary, stderr, detail=""):
     return summary + label + tail
 
 
-def _run(task, cwd, *, mode, on_event=None, timeout_seconds=None):
+def _run(task, cwd, *, mode, on_event=None, timeout_seconds=None, extra_patch=None, environment=None,
+         on_receipt=None, cancel=None):
+    """Run one Harness task.
+
+    The task must be received: Harness has to report that it started working within
+    HARNESS_RECEIPT_TIMEOUT_SECONDS. After that the call waits for the answer with no time
+    limit, unless the caller passed timeout_seconds or sets the optional `cancel` event.
+    """
     if not DSH.is_file():
         raise HarnessError("DeepSeek Harness CLI was not found in Applications")
     if not PATCH.is_file():
         raise HarnessError("DeepSeek Harness account patch is missing")
-    events = []
-    if timeout_seconds is None:
-        timeout_seconds = HARNESS_TIMEOUT_SECONDS
+    hard_limit = validate_timeout_seconds(timeout_seconds)
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    final = None
+    last_error = ""
+    args = [str(DSH), "--profile", "headless", "--patch", str(PATCH)]
+    if extra_patch is not None:
+        args.extend(["--patch", str(extra_patch)])
     with tempfile.TemporaryFile() as stderr:
+        started = time.monotonic()
+        hard_deadline = None if hard_limit is None else started + hard_limit
+        receipt_deadline = started + HARNESS_RECEIPT_TIMEOUT_SECONDS
+        received = False
+        stopped = None  # "receipt", "hard" or "cancelled"
         process = subprocess.Popen(
-            [str(DSH), "--profile", "headless", "--patch", str(PATCH), "--json", task],
+            [*args, "--json", task],
             cwd=cwd,
-            env=_environment(mode),
+            env=_environment(mode, environment),
             stdout=subprocess.PIPE,
             stderr=stderr,
             start_new_session=True,
         )
-        lines = queue.Queue()
+        lines = queue.Queue(maxsize=32)
+        stop_reader = threading.Event()
+
+        def enqueue(line):
+            while not stop_reader.is_set():
+                try:
+                    lines.put(line, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
 
         def pump_stdout():
             try:
                 for line in process.stdout:
-                    lines.put(line)
+                    if not enqueue(line):
+                        break
             finally:
-                lines.put(None)
+                enqueue(None)
 
         reader = threading.Thread(target=pump_stdout, daemon=True)
         reader.start()
-        deadline = time.monotonic() + timeout_seconds
         completed = False
         try:
-            while (remaining := deadline - time.monotonic()) > 0:
-                line = lines.get(timeout=remaining)
+            while True:
+                if cancel is not None and cancel.is_set():
+                    stopped = "cancelled"
+                    break
+                now = time.monotonic()
+                if hard_deadline is not None and now >= hard_deadline:
+                    stopped = "hard"
+                    break
+                if not received and now >= receipt_deadline:
+                    stopped = "receipt"
+                    break
+                limits = [d for d in (hard_deadline, None if received else receipt_deadline) if d is not None]
+                wait = min(limits) - now if limits else None
+                if cancel is not None:
+                    wait = 0.25 if wait is None else min(wait, 0.25)
+                try:
+                    line = lines.get(timeout=wait)
+                except queue.Empty:
+                    continue
                 if line is None:
-                    returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+                    # Output closed: the CLI is exiting. A short wait is enough here.
+                    returncode = process.wait(timeout=10)
                     completed = True
                     break
                 try:
                     event = json.loads(line.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
-                if isinstance(event, dict):
-                    events.append(event)
-                    if on_event is not None:
-                        on_event(event)
-        except (queue.Empty, subprocess.TimeoutExpired):
-            pass
+                if not isinstance(event, dict):
+                    continue
+                if not received and _is_progress(event):
+                    received = True
+                    if on_receipt is not None:
+                        on_receipt()
+                kind = event.get("type")
+                if kind == "final":
+                    final = event.get("text")
+                elif kind == "error":
+                    last_error = event.get("message") or event.get("error") or ""
+                elif kind == "status" and event.get("phase") == "step_end":
+                    step = event.get("usage")
+                    if isinstance(step, dict):
+                        for key, target in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"), ("totalTokens", "total_tokens")):
+                            if type(step.get(key)) is int:
+                                usage[target] += step[key]
+                if on_event is not None:
+                    on_event(event)
+        except subprocess.TimeoutExpired:
+            stopped = "exit"
         finally:
+            stop_reader.set()
             if not completed:
                 # The CLI may have exited while a child still holds stdout open.
                 # Kill the whole session so the reader can reach EOF promptly.
@@ -157,25 +249,23 @@ def _run(task, cwd, *, mode, on_event=None, timeout_seconds=None):
             if not reader.is_alive():
                 process.stdout.close()
         if not completed:
-            summary = f"DeepSeek Harness task timed out after {timeout_seconds:g} seconds"
+            if stopped == "cancelled":
+                raise HarnessCancelled("已停止等待 DeepSeek（主人手动停止）。"
+                                       + ("对方已收到，可能已产生用量。" if received else "对方尚未确认收到。"))
+            if stopped == "hard":
+                summary = f"DeepSeek Harness task timed out after {hard_limit:g} seconds (hard deadline)"
+            elif stopped == "receipt":
+                summary = (f"DeepSeek Harness did not confirm receipt within "
+                           f"{HARNESS_RECEIPT_TIMEOUT_SECONDS:g} seconds (not received)")
+            else:
+                summary = "DeepSeek Harness closed its output but did not exit"
             raise HarnessError(_failure_message(summary, stderr))
         if returncode != 0:
-            errors = [event.get("message") or event.get("error") for event in events if event.get("type") == "error"]
-            detail = str(errors[-1]) if errors and errors[-1] else ""
             summary = f"DeepSeek Harness: task failed (exit {returncode})"
-            raise HarnessError(_failure_message(summary, stderr, detail))
-        finals = [event.get("text") for event in events if event.get("type") == "final"]
-        if not finals or not isinstance(finals[-1], str):
+            raise HarnessError(_failure_message(summary, stderr, str(last_error)))
+        if not isinstance(final, str):
             raise HarnessError(_failure_message("DeepSeek Harness returned no final answer", stderr))
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    for event in events:
-        if event.get("type") == "status" and event.get("phase") == "step_end":
-            step = event.get("usage") or {}
-            for source, target in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"), ("totalTokens", "total_tokens")):
-                value = step.get(source)
-                if isinstance(value, int):
-                    usage[target] += value
-    return {"answer": finals[-1], "usage": usage}
+    return {"answer": final, "usage": usage}
 
 
 def consult(question, on_event=None):
@@ -186,12 +276,13 @@ def consult(question, on_event=None):
         return _run(task, cwd, mode="read-only", on_event=on_event)
 
 
-def consult_prepared(task, on_event=None, *, timeout_seconds=None):
+def consult_prepared(task, on_event=None, *, timeout_seconds=None, on_receipt=None):
     """Run the exact already-logged research task without appending a prefix."""
     if not isinstance(task, str) or not task.strip() or len(task) > 20000:
         raise ValueError("task must be 1 to 20000 characters")
     with tempfile.TemporaryDirectory(prefix="deepseek-research-") as cwd:
-        return _run(task, cwd, mode="read-only", on_event=on_event, timeout_seconds=timeout_seconds)
+        return _run(task, cwd, mode="read-only", on_event=on_event, timeout_seconds=timeout_seconds,
+                    on_receipt=on_receipt)
 
 
 def delegate(task, workspace: Workspace, on_event=None):

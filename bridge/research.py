@@ -12,6 +12,8 @@ KINDS = {"research_start", "research_phase", "research_claim", "research_evidenc
 PHASES = {"independent", "codex_verify", "challenge", "synthesis"}
 PHASE_STATES = {"started", "finished", "failed", "timeout", "skipped"}
 SIDES = {"ok", "failed", "timeout", "no_search"}
+LEGACY_TIMEOUT_SECONDS = 180
+STALL_GRACE_SECONDS = 30
 
 
 def _text(value, field, maximum, *, empty=False):
@@ -219,12 +221,21 @@ def record_phase(research_id: str, phase: str, state: str, *, disagreements=None
                    lambda old: old.get("actor") == "codex" and old.get("phase") == phase and old.get("state") == state)
 
 
-def record_deepseek_phase(research_id: str, phase: str, state: str, call_id: str, error=None) -> dict:
+_UNSET = object()
+
+
+def record_deepseek_phase(research_id: str, phase: str, state: str, call_id: str, error=None,
+                          timeout_seconds=_UNSET) -> dict:
+    """timeout_seconds on a started call: a positive limit, or None for "wait until answered"."""
     _choice(phase, "phase", {"independent", "challenge"})
     _choice(state, "state", {"started", "finished", "failed", "timeout"})
     data = {"phase": phase, "state": state, "actor": "deepseek", "call_id": _text(call_id, "call_id", 40)}
     if error is not None:
         data["error"] = _text(error, "error", 500)
+    if timeout_seconds is not _UNSET:
+        if timeout_seconds is not None and (type(timeout_seconds) is not int or timeout_seconds < 1):
+            raise ValueError("timeout_seconds must be a positive integer or None")
+        data["timeout_seconds"] = timeout_seconds
     return _append(research_id, "research_phase", data,
                    lambda old: old.get("actor") == "deepseek" and old.get("phase") == phase and old.get("state") == state and old.get("call_id") == call_id)
 
@@ -291,8 +302,17 @@ def snapshot(research_id: str, rows=None) -> dict:
     else:
         state = "进行中"
     running = [row for row in current if row["kind"] == "research_phase" and row.get("actor") == "deepseek" and row.get("state") == "started" and not any(x["kind"] == "research_phase" and x.get("actor") == "deepseek" and x.get("call_id") == row.get("call_id") and x.get("state") in {"finished", "failed", "timeout"} for x in current)]
-    if running and (datetime.now(timezone.utc) - datetime.fromisoformat(running[-1]["at"])).total_seconds() > 210:
-        warning = "调用疑似卡住"
+    if running:
+        call = running[-1]
+        if "timeout_seconds" in call and call["timeout_seconds"] is None:
+            # No total limit: the call was sent to be answered whenever DeepSeek finishes.
+            if not finish_event:
+                state = "进行中"
+        else:
+            # Calls logged before per-call limits existed used a fixed 180-second deadline.
+            limit = call.get("timeout_seconds") or LEGACY_TIMEOUT_SECONDS
+            if (datetime.now(timezone.utc) - datetime.fromisoformat(call["at"])).total_seconds() > limit + STALL_GRACE_SECONDS:
+                warning = "调用疑似卡住"
     return {"research_id": research_id, "question_public": start_event["question_public"],
             "constraints": start_event["constraints"], "budget_seconds": start_event["budget_seconds"],
             "state": state, "last_activity": current[-1]["at"], "claims": claims,

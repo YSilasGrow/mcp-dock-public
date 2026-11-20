@@ -32,7 +32,7 @@ class ThreadDispatchTests(unittest.TestCase):
         tasks.post_message(self.a, "白狼-5")
         tasks.post_message(self.b, "赤狐-3", share=True)
 
-        def harness(prompt, *, timeout_seconds):
+        def harness(prompt, *, timeout_seconds, on_receipt=None):
             saved = tasks.read_thread(self.a)["messages"][-1]
             self.assertEqual(saved["kind"], "thread_dispatch")
             self.assertEqual(prompt, saved["text"])
@@ -212,15 +212,31 @@ class ThreadDispatchTests(unittest.TestCase):
         self.assertEqual(result["state"], "timeout")
         self.assertIn("waiting for profile initialization", result["error"])
 
+    def test_receipt_is_recorded_and_no_limit_applies_after_it(self):
+        self._fake_harness(
+            "import json, time\n"
+            "print(json.dumps({'type':'status','phase':'turn_start'}), flush=True)\n"
+            "time.sleep(1.5)\n"
+            "print(json.dumps({'type':'final','text':'慢慢想好了'}), flush=True)\n"
+        )
+        with patch.object(harness, "HARNESS_RECEIPT_TIMEOUT_SECONDS", 1):
+            result = server.thread_ask_deepseek(self.a, "问题", "independent")
+        self.assertEqual(result["answer"], "慢慢想好了")
+        rows = tasks.read_thread(self.a)["messages"]
+        self.assertEqual([row["kind"] for row in rows],
+                         ["thread_dispatch", "thread_received", "thread_result", "thread_reply"])
+        self.assertIsNone(rows[0]["timeout_seconds"])
+
     def test_default_and_maximum_timeout_are_recorded(self):
         with patch.object(server, "consult_prepared", return_value={"answer": "完成"}):
             server.thread_ask_deepseek(self.a, "问题", "independent")
             server.thread_ask_deepseek(self.a, "问题", "shared", timeout_seconds=600)
         rows = tasks.read_thread(self.a)["messages"]
-        self.assertEqual([row["timeout_seconds"] for row in rows if row["kind"] == "thread_dispatch"], [180, 600])
+        # Omitted means no total limit: the call only has to be received.
+        self.assertEqual([row["timeout_seconds"] for row in rows if row["kind"] == "thread_dispatch"], [None, 600])
 
     def test_invalid_timeouts_do_not_create_dispatch(self):
-        for invalid in (0, -1, 601, True, 1.5, "180", None):
+        for invalid in (0, -1, 601, True, 1.5, "180"):
             with self.subTest(timeout=invalid):
                 with self.assertRaises(ValueError):
                     server.thread_ask_deepseek(self.a, "问题", "shared", timeout_seconds=invalid)
